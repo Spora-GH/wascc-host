@@ -5,10 +5,14 @@
 
 use wascc_host::{HostManifest, WasccHost};
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "wascc_host=info"),
+    )
+    .format_module_path(false)
+    .try_init();
     let host = WasccHost::new();
-    host.apply_manifest(HostManifest::from_yaml(
+    host.apply_manifest(HostManifest::from_path(
         "./examples/sample_manifest.yaml",
         true,
     )?)?;

@@ -26,20 +26,31 @@ struct CliCommand {
     expand_env: bool,
 }
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+#[cfg(feature = "manifest")]
+fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::from_args();
     let cmd = args.command;
-    let _ = env_logger::builder().format_module_path(false).try_init();
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "wascc_host=info"),
+    )
+    .format_module_path(false)
+    .try_init();
+
     let host = WasccHost::new();
 
-    let manifest = HostManifest::from_yaml(cmd.manifest_path, cmd.expand_env)?;
-    info!(
-        "waSCC Host Manifest loaded, CWD: {:?}",
-        std::env::current_dir()?
-    );
+    let manifest = HostManifest::from_path(cmd.manifest_path, cmd.expand_env)?;
     host.apply_manifest(manifest)?;
+    info!("Processed and applied host manifest");
 
     std::thread::park();
 
+    Ok(())
+}
+
+#[cfg(not(feature = "manifest"))]
+fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!(
+        "The general-purpose waSCC host application needs to be built with the `manifest` feature."
+    );
     Ok(())
 }
