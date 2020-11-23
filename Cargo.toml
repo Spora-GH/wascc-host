@@ -40,15 +40,11 @@ rand = "0.7.3"
 env_logger = "0.7.1"
 ring = "0.16.15"
 data-encoding = "2.3.0"
-<<<<<<< HEAD
 opentelemetry = "0.10.0"
-=======
 oci-distribution = "0.4.0"
 uuid = { version = "0.8", features = ["serde", "v4"] }
 futures = "0.3.6"
 provider-archive = "0.1.0"
-
->>>>>>> 529f1cfc54341c5acfc614c99ae731323c97176a
 
 # Opt-in dependencies chosen by feature flags
 nats = { version = "0.8.1", optional = true }
