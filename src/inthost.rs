@@ -23,6 +23,7 @@ use wascc_codec::{
     core::{CapabilityConfiguration, OP_PERFORM_LIVE_UPDATE, OP_REMOVE_ACTOR},
     deserialize, serialize, SYSTEM_ACTOR,
 };
+use opentelemetry;
 
 pub(crate) const CORELABEL_ARCH: &str = "hostcore.arch";
 pub(crate) const CORELABEL_OS: &str = "hostcore.os";
@@ -209,6 +210,7 @@ pub struct Invocation {
     pub id: String,
     pub encoded_claims: String,
     pub host_id: String,
+    pub context: Option<opentelemetry::Context>
 }
 
 /// Represents an invocation target - either an actor or a bound capability provider
@@ -259,6 +261,7 @@ impl Invocation {
             id: subject,
             encoded_claims: claims.encode(&hostkey).unwrap(),
             host_id: issuer.to_string(),
+            context: None
         }
     }
 
