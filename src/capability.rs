@@ -1,17 +1,3 @@
-// Copyright 2015-2020 Capital One Services, LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use crate::Result;
 use libloading::Library;
 use libloading::Symbol;
@@ -38,7 +24,10 @@ impl NativeCapability {
     /// Reads a capability provider from a file. The capability provider must implement the
     /// correct FFI interface to support waSCC plugins. See [wascc.dev](https://wascc.dev) for
     /// documentation and tutorials on how to create a native capability provider
-    pub fn from_file<P: AsRef<OsStr>>(filename: P, binding_name: Option<String>) -> Result<Self> {
+    pub fn from_file<P: AsRef<OsStr>>(
+        filename: P,
+        binding_target_name: Option<String>,
+    ) -> Result<Self> {
         type PluginCreate = unsafe fn() -> *mut dyn CapabilityProvider;
 
         let library = Library::new(filename.as_ref())?;
@@ -50,7 +39,7 @@ impl NativeCapability {
             Box::from_raw(boxed_raw)
         };
         let descriptor = get_descriptor(&plugin)?;
-        let binding = binding_name.unwrap_or("default".to_string());
+        let binding = binding_target_name.unwrap_or("default".to_string());
         info!(
             "Loaded native capability provider '{}' v{} ({}) for {}/{}",
             descriptor.name, descriptor.version, descriptor.revision, descriptor.id, binding
@@ -71,11 +60,11 @@ impl NativeCapability {
     /// that the provider supports capability embedding.    
     pub fn from_instance(
         instance: impl CapabilityProvider,
-        binding_name: Option<String>,
+        binding_target_name: Option<String>,
     ) -> Result<Self> {
         let b: Box<dyn CapabilityProvider> = Box::new(instance);
         let descriptor = get_descriptor(&b)?;
-        let binding = binding_name.unwrap_or("default".to_string());
+        let binding = binding_target_name.unwrap_or("default".to_string());
 
         info!(
             "Loaded native capability provider '{}' v{} ({}) for {}/{}",

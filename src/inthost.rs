@@ -1,6 +1,6 @@
-// Implementations of support functions for the `WasccHost` struct
+// Implementations of support functions for the `Host` struct
 
-use super::WasccHost;
+use super::Host;
 use crate::Result;
 use data_encoding::HEXUPPER;
 use ring::digest::{Context, Digest, SHA256};
@@ -10,13 +10,15 @@ use crate::bus::MessageBus;
 use crate::BindingsList;
 use crate::{authz, errors, Actor, Authorizer, NativeCapability, RouteKey};
 use errors::ErrorKind;
+use provider_archive::ProviderArchive;
+use std::str::FromStr;
 use std::{
     collections::HashMap,
     io::Read,
     sync::{Arc, RwLock},
 };
 use uuid::Uuid;
-use wapc::prelude::*;
+use wapc::WapcHost;
 use wascap::{jwt::Claims, prelude::KeyPair};
 use wascc_codec::{
     capabilities::{CapabilityDescriptor, OP_GET_CAPABILITY_DESCRIPTOR},
@@ -28,9 +30,14 @@ use opentelemetry;
 pub(crate) const CORELABEL_ARCH: &str = "hostcore.arch";
 pub(crate) const CORELABEL_OS: &str = "hostcore.os";
 pub(crate) const CORELABEL_OSFAMILY: &str = "hostcore.osfamily";
+
+pub(crate) const OCI_VAR_USER: &str = "OCI_REGISTRY_USER";
+pub(crate) const OCI_VAR_PASSWORD: &str = "OCI_REGISTRY_PASSWORD";
+
 #[allow(dead_code)]
 pub(crate) const RESTRICTED_LABELS: [&str; 3] = [CORELABEL_OSFAMILY, CORELABEL_ARCH, CORELABEL_OS];
 
+// Unsubscribes all of the private actor-provider comms subjects
 pub(crate) fn unsub_all_bindings(
     bindings: Arc<RwLock<BindingsList>>,
     bus: Arc<MessageBus>,
@@ -42,11 +49,11 @@ pub(crate) fn unsub_all_bindings(
         .keys()
         .filter(|(_a, c, _b)| c == capid)
         .for_each(|(a, c, b)| {
-            let _ = bus.unsubscribe(&bus::provider_subject_bound_actor(c, b, a));
+            let _ = bus.unsubscribe(&bus.provider_subject_bound_actor(c, b, a));
         });
 }
 
-impl WasccHost {
+impl Host {
     pub(crate) fn record_binding(
         &self,
         actor: &str,
@@ -100,7 +107,7 @@ pub(crate) fn replace_actor(
     new_actor: Actor,
 ) -> Result<()> {
     let public_key = new_actor.token.claims.subject;
-    let tgt_subject = crate::bus::actor_subject(&public_key);
+    let tgt_subject = bus.actor_subject(&public_key);
     let inv = gen_liveupdate_invocation(hostkey, &public_key, new_actor.bytes);
 
     match bus.invoke(&tgt_subject, inv) {
@@ -132,7 +139,7 @@ fn gen_liveupdate_invocation(hostkey: &KeyPair, target: &str, bytes: Vec<u8>) ->
     )
 }
 
-/// Removes all bindings for a given actor by sending the "deconfigure" message
+/// Removes all bindings for a given actor by sending the "remove actor" message
 /// to each of the capabilities
 pub(crate) fn deconfigure_actor(
     hostkey: KeyPair,
@@ -140,6 +147,17 @@ pub(crate) fn deconfigure_actor(
     bindings: Arc<RwLock<BindingsList>>,
     key: &str,
 ) {
+    #[cfg(feature = "lattice")]
+    {
+        // Don't remove the bindings for this actor unless it's the last instance in the lattice
+        if let Ok(i) = bus.instance_count(key) {
+            if i > 0 {
+                // This is 0 because the actor being removed has already been taken out of the claims map, so bus queries will not see the local instance
+                info!("Actor instance terminated at scale > 1, bypassing binding removal.");
+                return;
+            }
+        }
+    }
     let cfg = CapabilityConfiguration {
         module: key.to_string(),
         values: HashMap::new(),
@@ -157,7 +175,7 @@ pub(crate) fn deconfigure_actor(
     for (actor, capid, binding) in nbindings {
         info!("Unbinding actor {} from {},{}", actor, binding, capid);
         let _inv_r = bus.invoke(
-            &bus::provider_subject_bound_actor(&capid, &binding, &actor),
+            &bus.provider_subject(&capid, &binding), // The OP_REMOVE_ACTOR invocation should go to _all_ instances of the provider being unbound
             gen_remove_actor(&hostkey, buf.clone(), &binding, &capid),
         );
         remove_binding(bindings.clone(), key, &binding, &capid);
@@ -199,6 +217,7 @@ pub(crate) fn gen_remove_actor(
         msg,
     )
 }
+
 /// An immutable representation of an invocation within waSCC
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "lattice", derive(serde::Serialize, serde::Deserialize))]
@@ -418,17 +437,63 @@ pub(crate) fn wapc_host_callback(
     // Make a request on either `wasmbus.Mxxxxx` for an actor or `wasmbus.{capid}.{binding}.{calling-actor}` for
     // a bound capability provider
     let invoke_subject = match &inv.target {
-        WasccEntity::Actor(subject) => bus::actor_subject(subject),
+        WasccEntity::Actor(subject) => bus.actor_subject(subject),
         WasccEntity::Capability { capid, binding } => {
-            bus::provider_subject_bound_actor(capid, binding, &claims.subject)
+            bus.provider_subject_bound_actor(capid, binding, &claims.subject)
         }
     };
     match bus.invoke(&invoke_subject, inv) {
-        Ok(inv_r) => Ok(inv_r.msg),
+        Ok(inv_r) => match inv_r.error {
+            Some(e) => Err(format!("Invocation failure: {}", e).into()),
+            None => Ok(inv_r.msg),
+        },
         Err(e) => Err(Box::new(errors::new(errors::ErrorKind::HostCallFailure(
             e.into(),
         )))),
     }
+}
+
+pub(crate) fn fetch_oci_bytes(img: &str) -> Result<Vec<u8>> {
+    let cfg = oci_distribution::client::ClientConfig::default();
+    let mut c = oci_distribution::Client::new(cfg);
+
+    let img = oci_distribution::Reference::from_str(img).map_err(|e| {
+        crate::errors::new(crate::errors::ErrorKind::MiscHost(format!(
+            "Failed to parse OCI distribution reference: {}",
+            e
+        )))
+    })?;
+    let auth = if let Ok(u) = std::env::var(OCI_VAR_USER) {
+        if let Ok(p) = std::env::var(OCI_VAR_PASSWORD) {
+            oci_distribution::secrets::RegistryAuth::Basic(u, p)
+        } else {
+            oci_distribution::secrets::RegistryAuth::Anonymous
+        }
+    } else {
+        oci_distribution::secrets::RegistryAuth::Anonymous
+    };
+    let imgdata: Result<oci_distribution::client::ImageData> =
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            c.pull_image(&img, &auth)
+                .await
+                .map_err(|e| format!("{}", e).into())
+        });
+
+    match imgdata {
+        Ok(imgdata) => Ok(imgdata.content),
+        Err(e) => {
+            error!("Failed to fetch OCI bytes: {}", e);
+            Err(crate::errors::new(crate::errors::ErrorKind::MiscHost(
+                "Failed to fetch OCI bytes".to_string(),
+            )))
+        }
+    }
+}
+
+pub(crate) fn fetch_provider_archive(img: &str) -> Result<ProviderArchive> {
+    let bytes = fetch_oci_bytes(img)?;
+    ProviderArchive::try_load(&bytes)
+        .map_err(|e| format!("Failed to load provider archive: {}", e).into())
 }
 
 fn invocation_from_callback(
@@ -556,8 +621,55 @@ pub(crate) fn detect_core_host_labels() -> HashMap<String, String> {
         CORELABEL_OSFAMILY.to_string(),
         std::env::consts::FAMILY.to_string(),
     );
-    trace!("Intrinsic host labels: {:?}", hm);
+    info!("Detected Intrinsic host labels. hostcore.arch = {}, hostcore.os = {}, hostcore.family = {}",
+          std::env::consts::ARCH,
+          std::env::consts::OS,
+          std::env::consts::FAMILY,
+    );
     hm
+}
+
+pub(crate) fn fetch_actor(actor_id: &str) -> Result<crate::actor::Actor> {
+    let vec = crate::inthost::fetch_oci_bytes(actor_id)?;
+
+    crate::actor::Actor::from_slice(&vec)
+}
+
+pub(crate) fn fetch_provider(
+    provider_ref: &str,
+    binding_name: &str,
+    labels: Arc<RwLock<HashMap<String, String>>>,
+) -> Result<(
+    crate::capability::NativeCapability,
+    Claims<wascap::jwt::CapabilityProvider>,
+)> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let par = crate::inthost::fetch_provider_archive(provider_ref)?;
+    let lock = labels.read().unwrap();
+    let target = format!("{}-{}", lock[CORELABEL_ARCH], lock[CORELABEL_OS]);
+    let v = par.target_bytes(&target);
+    if let Some(v) = v {
+        let path = std::env::temp_dir();
+        let path = path.join(target);
+        {
+            let mut tf = File::create(&path)?;
+            tf.write_all(&v)?;
+        }
+        let nc = NativeCapability::from_file(path, Some(binding_name.to_string()))?;
+        if let Some(c) = par.claims() {
+            Ok((nc, c))
+        } else {
+            Err(format!(
+                "No embedded claims found in provider archive for {}",
+                provider_ref
+            )
+            .into())
+        }
+    } else {
+        Err(format!("No binary found in provider archive for {}", target).into())
+    }
 }
 
 #[cfg(test)]

@@ -1,19 +1,4 @@
 //! Custom error types
-
-// Copyright 2015-2020 Capital One Services, LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -35,6 +20,7 @@ pub enum ErrorKind {
     MiscHost(String),
     Plugin(libloading::Error),
     Middleware(String),
+    Serialization(String),
 }
 
 impl Error {
@@ -59,6 +45,7 @@ impl StdError for Error {
             ErrorKind::MiscHost(_) => "waSCC Host error",
             ErrorKind::Plugin(_) => "Plugin error",
             ErrorKind::Middleware(_) => "Middleware error",
+            ErrorKind::Serialization(_) => "Serialization failure",
         }
     }
 
@@ -73,6 +60,7 @@ impl StdError for Error {
             ErrorKind::MiscHost(_) => None,
             ErrorKind::Plugin(ref err) => Some(err),
             ErrorKind::Middleware(_) => None,
+            ErrorKind::Serialization(_) => None,
         }
     }
 }
@@ -95,6 +83,7 @@ impl fmt::Display for Error {
             ErrorKind::MiscHost(ref err) => write!(f, "waSCC Host Error: {}", err),
             ErrorKind::Plugin(ref err) => write!(f, "Plugin error: {}", err),
             ErrorKind::Middleware(ref err) => write!(f, "Middleware error: {}", err),
+            ErrorKind::Serialization(ref err) => write!(f, "Serialization failure: {}", err),
         }
     }
 }
@@ -125,6 +114,12 @@ impl From<std::io::Error> for Error {
 impl From<Box<dyn StdError + Send + Sync>> for Error {
     fn from(source: Box<dyn StdError + Send + Sync>) -> Error {
         Error(Box::new(ErrorKind::HostCallFailure(source)))
+    }
+}
+
+impl From<String> for Error {
+    fn from(source: String) -> Error {
+        Error(Box::new(ErrorKind::MiscHost(source)))
     }
 }
 

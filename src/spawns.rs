@@ -1,40 +1,27 @@
-// Copyright 2015-2020 Capital One Services, LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use crate::Result;
 
-use crate::bus;
 use crate::inthost::*;
 use crate::BindingsList;
-use crate::{authz, middleware, NativeCapability};
 use crate::{
     bus::MessageBus, dispatch::WasccNativeDispatcher, plugins::PluginManager, Authorizer,
     Invocation, InvocationResponse, Middleware, RouteKey,
 };
-use authz::ClaimsMap;
+use crate::{middleware, NativeCapability};
+
 use crossbeam::{Receiver, Sender};
 use crossbeam_channel as channel;
 use crossbeam_utils::sync::WaitGroup;
+#[cfg(feature = "lattice")]
+use latticeclient::BusEvent;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use wapc::prelude::*;
+use wapc::{WapcHost, WasiParams};
 use wascap::{jwt::Claims, prelude::KeyPair};
 use wascc_codec::{
     capabilities::{CapabilityDescriptor, OP_GET_CAPABILITY_DESCRIPTOR},
-    core::{CapabilityConfiguration, OP_BIND_ACTOR, OP_PERFORM_LIVE_UPDATE, OP_REMOVE_ACTOR},
-    deserialize,
+    core::{CapabilityConfiguration, OP_BIND_ACTOR, OP_REMOVE_ACTOR},
+    deserialize, serialize, SYSTEM_ACTOR,
 };
 
 /// Spawns a new background thread in which a new `WapcHost` is created for the actor
@@ -53,39 +40,52 @@ pub(crate) fn spawn_actor(
     mids: Arc<RwLock<Vec<Box<dyn Middleware>>>>,
     caps: Arc<RwLock<HashMap<RouteKey, CapabilityDescriptor>>>,
     bindings: Arc<RwLock<BindingsList>>,
-    claimsmap: ClaimsMap,
+    claimsmap: Arc<RwLock<HashMap<String, Claims<wascap::jwt::Actor>>>>,
     terminators: Arc<RwLock<HashMap<String, Sender<bool>>>>,
     hk: KeyPair,
     auth: Arc<RwLock<Box<dyn Authorizer>>>,
+    image_map: Arc<RwLock<HashMap<String, String>>>,
+    imgref: Option<String>,
 ) -> Result<()> {
     let c = claims.clone();
     let b = bus.clone();
-    let m = mids.clone();
-    let bi = binding.clone();
-    let hostkey = hk.clone();
+    let seed = hk.seed().unwrap();
+    let s = seed.clone();
+    let hostkey = KeyPair::from_seed(&hk.seed().unwrap()).unwrap();
     let authorizer = auth.clone();
+
     thread::spawn(move || {
-        let mut guest = WapcHost::new(
-            move |_id, bd, ns, op, payload| {
-                wapc_host_callback(
-                    hk.clone(),
-                    c.clone(),
-                    bus.clone(),
-                    bd,
-                    ns,
-                    op,
-                    payload,
-                    authorizer.clone(),
-                )
-            },
-            &buf,
-            wasi,
-        )
+        let hk = KeyPair::from_seed(&seed).unwrap();
+        if actor {
+            #[cfg(feature = "lattice")]
+            let _ = bus.publish_event(BusEvent::ActorStarting {
+                host: hostkey.public_key(),
+                actor: claims.subject.to_string(),
+            });
+        }
+        #[cfg(feature = "wasmtime")]
+        let engine = wasmtime_provider::WasmtimeEngineProvider::new(&buf, wasi);
+        #[cfg(feature = "wasm3")]
+        let engine = wasm3_provider::Wasm3EngineProvider::new(&buf);
+
+        let mut guest = WapcHost::new(Box::new(engine), move |_id, bd, ns, op, payload| {
+            let key = KeyPair::from_seed(&s).unwrap();
+            wapc_host_callback(
+                key,
+                c.clone(),
+                bus.clone(),
+                bd,
+                ns,
+                op,
+                payload,
+                authorizer.clone(),
+            )
+        })
         .unwrap();
         let mut d: Option<CapabilityDescriptor> = None;
 
         let subscribe_subject = if actor {
-            bus::actor_subject(&claims.subject)
+            b.actor_subject(&claims.subject)
         } else {
             d = match get_descriptor(&mut guest) {
                 Ok(d) => Some(d),
@@ -94,7 +94,16 @@ pub(crate) fn spawn_actor(
             if d.is_none() {
                 return "".to_string();
             }
-            bus::provider_subject(&d.as_ref().unwrap().id, binding.unwrap().as_ref())
+            let capid = d.as_ref().unwrap().id.to_string();
+            let bname = binding.clone().unwrap();
+            #[cfg(feature = "lattice")]
+            let _ = b.publish_event(BusEvent::ProviderLoaded {
+                host: hostkey.public_key(),
+                capid: capid.to_string(),
+                instance_name: bname.to_string(),
+            });
+
+            b.provider_subject(&capid, &bname)
         };
 
         let (inv_s, inv_r): (Sender<Invocation>, Receiver<Invocation>) = channel::unbounded();
@@ -110,20 +119,20 @@ pub(crate) fn spawn_actor(
             .unwrap()
             .insert(subscribe_subject.clone(), term_s);
         let _ = b.subscribe(&subscribe_subject, inv_s, resp_r).unwrap();
-        drop(wg); // Let the WasccHost wrapper function return
-
+        drop(wg); // Let the Host wrapper function return
+        if actor {
+            #[cfg(feature = "lattice")]
+            let _ = b.publish_event(BusEvent::ActorStarted {
+                host: hostkey.public_key(),
+                actor: claims.subject.to_string(),
+            });
+            info!("Actor {} up and running.", &claims.subject);
+        }
         loop {
-            let mids = m.clone();
-            let binding = bi.clone();
-            let bus = b.clone();
-
+            let key = KeyPair::from_seed(&seed).unwrap();
             select! {
                 recv(inv_r) -> inv => {
                     if let Ok(inv) = inv {
-                        if inv.operation == OP_PERFORM_LIVE_UPDATE && actor { // Preempt the middleware chain if the operation is a live update
-                            resp_s.send(live_update(&mut guest, &inv)).unwrap();
-                            continue;
-                        }
                         let inv_r = if actor {
                             middleware::invoke_actor(mids.clone(), inv.clone(), &mut guest).unwrap()
                         } else {
@@ -142,19 +151,32 @@ pub(crate) fn spawn_actor(
                 recv(term_r) -> _term => {
                     info!("Terminating {} {}", if actor { "actor" } else { "capability" }, &claims.subject);
                     let _ = b.unsubscribe(&subscribe_subject);
+                    terminators.write().unwrap().remove(&subscribe_subject);
                     if !actor {
-                        remove_cap(caps, &d.as_ref().unwrap().id, binding.unwrap().as_ref()); // for cap providers, route key is the capid
-                        // TODO: unsubscribe all the actor-specific subscriptions for this provider
-                        unbind_all_from_cap(bindings.clone(), &d.unwrap().id, bi.unwrap().as_ref());
+                        //#[cfg(feature = "lattice")]
+                        //let _ = bus.publish_event(BusEvent::ProviderRemoved{ host: hostkey.public_key(), actor: claims.subject.to_string() });
+                        remove_cap(caps.clone(), &d.as_ref().unwrap().id, binding.as_ref().unwrap()); // for cap providers, route key is the capid
+                        unbind_all_from_cap(bindings.clone(), &d.unwrap().id, binding.as_ref().unwrap());
                     } else {
-                        deconfigure_actor(hostkey.clone(),bus.clone(), bindings.clone(), &claims.subject);
-                        authz::unregister_claims(claimsmap, &claims.subject);
+                        #[cfg(feature = "lattice")]
+                        let _ = b.publish_event(BusEvent::ActorStopped{ host: hostkey.public_key(), actor: claims.subject.to_string() });
+
+                        let mut lock = claimsmap.write().unwrap();
+                        let _ = lock.remove(&claims.subject);
+                        drop(lock);
+                        if let Some(ref ir) = imgref { // if this actor was added via OCI image ref, remove the mapping
+                            let mut lock = image_map.write().unwrap();
+                            let _ = lock.remove(ir);
+                            drop(lock);
+                        }
+                        deconfigure_actor(key,b.clone(), bindings.clone(), &claims.subject);
                     }
-                    return "".to_string()
+                    break "".to_string(); // TODO: WHY WHY WHY does this recv arm need to return a value?!?!?
                 }
             }
         }
     });
+
     Ok(())
 }
 
@@ -170,6 +192,16 @@ pub(crate) fn spawn_native_capability(
 ) -> Result<()> {
     let capid = capability.id().to_string();
     let binding = capability.binding_name.to_string();
+    let b = bus.clone();
+
+    let b2 = bus.clone();
+    let mid2 = mids.clone();
+    let binding2 = bindings.clone();
+    let plugin2 = plugins.clone();
+    let h2 = hk.clone();
+    let t2 = terminators.clone();
+    let capid2 = capid.clone();
+    let bindingname2 = binding.clone();
 
     plugins.write().unwrap().add_plugin(capability)?;
 
@@ -178,10 +210,10 @@ pub(crate) fn spawn_native_capability(
         let (resp_s, resp_r): (Sender<InvocationResponse>, Receiver<InvocationResponse>) =
             channel::unbounded();
         let (term_s, term_r): (Sender<bool>, Receiver<bool>) = channel::unbounded();
-        let subscribe_subject = bus::provider_subject(&capid, &binding);
+        let subscribe_subject = bus.provider_subject(&capid, &binding);
 
-        let _ = bus.subscribe(&subscribe_subject, inv_s, resp_r).unwrap();
-        let dispatcher = WasccNativeDispatcher::new(hk, bus.clone(), &capid, &binding);
+        let _ = bus.nqsubscribe(&subscribe_subject, inv_s, resp_r).unwrap();
+        let dispatcher = WasccNativeDispatcher::new(hk.clone(), bus.clone(), &capid, &binding);
         plugins
             .write()
             .unwrap()
@@ -195,19 +227,30 @@ pub(crate) fn spawn_native_capability(
         info!("Native capability provider '({},{})' ready", binding, capid);
 
         drop(wg);
+        #[cfg(feature = "lattice")]
+        let _ = b.publish_event(BusEvent::ProviderLoaded {
+            host: hk.public_key(),
+            capid: capid.to_string(),
+            instance_name: binding.to_string(),
+        });
 
         loop {
             select! {
                 recv(inv_r) -> inv => {
                     if let Ok(inv) = inv {
-                        let inv_r = if inv.operation != OP_BIND_ACTOR && inv.operation != OP_GET_CAPABILITY_DESCRIPTOR {
+                        let inv_r = if inv.operation != OP_BIND_ACTOR && inv.operation != OP_GET_CAPABILITY_DESCRIPTOR && inv.operation != OP_REMOVE_ACTOR {
                             InvocationResponse::error(&inv, "Attempted to invoke binding-required operation on unbound provider")
                         } else {
                             middleware::invoke_native_capability(mids.clone(), inv.clone(), plugins.clone()).unwrap()
                         };
                         resp_s.send(inv_r.clone()).unwrap();
                         if inv.operation == OP_BIND_ACTOR && inv_r.error.is_none() {
-                            spawn_bound_native_capability(bus.clone(), inv, &capid, &binding, mids.clone(), plugins.clone(), terminators.clone(), bindings.clone());
+                            spawn_bound_native_capability(bus.clone(), inv.clone(), &capid, &binding, mids.clone(), plugins.clone(), terminators.clone(), bindings.clone(), hk.clone());
+                        }
+                        if inv.operation == OP_REMOVE_ACTOR && inv_r.error.is_none() {
+                            let actor = actor_from_config(&inv.msg);
+                            let key = bus.provider_subject_bound_actor(&capid, &binding, &actor);
+                            terminators.read().unwrap()[&key].send(true).unwrap();
                         }
                     }
                 },
@@ -217,15 +260,96 @@ pub(crate) fn spawn_native_capability(
                     unsub_all_bindings(bindings.clone(), bus.clone(), &capid);
                     let _ = bus.unsubscribe(&subscribe_subject);
                     plugins.write().unwrap().remove_plugin(&binding, &capid).unwrap();
+                    terminators.write().unwrap().remove(&subscribe_subject);
+                    #[cfg(feature="lattice")]
+                    let _ = b.publish_event(BusEvent::ProviderRemoved{ host: hk.public_key(), capid: capid.to_string(), instance_name: binding.to_string()});
                     break;
                 }
             }
         }
     });
 
+    #[cfg(feature = "lattice")]
+    reestablish_bindings(
+        b2.clone(),
+        mid2.clone(),
+        binding2.clone(),
+        plugin2.clone(),
+        t2.clone(),
+        h2.clone(),
+        &capid2,
+        &bindingname2,
+    );
     Ok(())
 }
 
+#[cfg(feature = "lattice")]
+fn reestablish_bindings(
+    bus: Arc<MessageBus>,
+    mids: Arc<RwLock<Vec<Box<dyn Middleware>>>>,
+    bindings: Arc<RwLock<BindingsList>>,
+    plugins: Arc<RwLock<PluginManager>>,
+    terminators: Arc<RwLock<HashMap<String, Sender<bool>>>>,
+    hk: Arc<KeyPair>,
+    capid: &str,
+    binding_name: &str,
+) {
+    // 1. load pre-existing bindings from bus
+    // 2. for each binding, invoke OP_BIND_ACTOR on the root capability
+    // 3.    if successful,  spawn the bound actor-capability comms thread
+    if let Ok(blist) = bus.query_bindings() {
+        for b in blist {
+            if b.capability_id == capid && b.binding_name == binding_name {
+                let cfgvals = CapabilityConfiguration {
+                    module: b.actor.to_string(),
+                    values: b.configuration.clone(),
+                };
+                let payload = serialize(&cfgvals).unwrap();
+                let inv = Invocation::new(
+                    &hk,
+                    WasccEntity::Actor(SYSTEM_ACTOR.to_string()),
+                    WasccEntity::Capability {
+                        capid: capid.to_string(),
+                        binding: binding_name.to_string(),
+                    },
+                    OP_BIND_ACTOR,
+                    payload,
+                );
+                let inv_r = middleware::invoke_native_capability(
+                    mids.clone(),
+                    inv.clone(),
+                    plugins.clone(),
+                )
+                .unwrap();
+                if inv_r.error.is_none() {
+                    info!(
+                        "Re-establishing binding between {} and {},{}",
+                        &b.actor, &capid, &binding_name
+                    );
+                    spawn_bound_native_capability(
+                        bus.clone(),
+                        inv.clone(),
+                        &capid,
+                        &binding_name,
+                        mids.clone(),
+                        plugins.clone(),
+                        terminators.clone(),
+                        bindings.clone(),
+                        hk.clone(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn actor_from_config(bytes: &[u8]) -> String {
+    let config: CapabilityConfiguration = deserialize(bytes).unwrap();
+    config.module
+}
+
+// This is a thread that handles the private conversations between an actor and a capability.
+// On the lattice, this means that actor-to-provider requests occur on a topic made up of actor+provider capid+provider instance/binding name
 fn spawn_bound_native_capability(
     bus: Arc<MessageBus>,
     inv: Invocation,
@@ -235,6 +359,7 @@ fn spawn_bound_native_capability(
     plugins: Arc<RwLock<PluginManager>>,
     terminators: Arc<RwLock<HashMap<String, Sender<bool>>>>,
     bindings: Arc<RwLock<BindingsList>>,
+    hk: Arc<KeyPair>,
 ) {
     let capid = capid.to_string();
     let binding = binding.to_string();
@@ -248,28 +373,29 @@ fn spawn_bound_native_capability(
         let (inv_s, inv_r): (Sender<Invocation>, Receiver<Invocation>) = channel::unbounded();
         let (resp_s, resp_r): (Sender<InvocationResponse>, Receiver<InvocationResponse>) =
             channel::unbounded();
+        let subscribe_subject = bus.provider_subject_bound_actor(&capid, &binding, &actor);
         let (term_s, term_r): (Sender<bool>, Receiver<bool>) = channel::unbounded();
-        let subscribe_subject = bus::provider_subject_bound_actor(&capid, &binding, &actor);
 
         let _ = bus.subscribe(&subscribe_subject, inv_s, resp_r).unwrap();
         terms
             .write()
             .unwrap()
             .insert(subscribe_subject.to_string(), term_s.clone());
+
         loop {
             select! {
                 recv(inv_r) -> inv => {
                     if let Ok(inv) = inv {
                         let inv_r = middleware::invoke_native_capability(mids.clone(), inv.clone(), plugins.clone()).unwrap();
                         resp_s.send(inv_r).unwrap();
-                        if inv.operation == OP_REMOVE_ACTOR {
-                            term_s.send(true).unwrap();
-                        }
                     }
                 },
                 recv(term_r) -> _term => {
                     let _ = bus.unsubscribe(&subscribe_subject);
                     remove_binding(bindings.clone(), &actor, &binding, &capid);
+                    terminators.write().unwrap().remove(&subscribe_subject);
+                    #[cfg(feature="lattice")]
+                    let _ = bus.publish_event(BusEvent::ProviderRemoved{ host: hk.public_key(), capid: capid.to_string(), instance_name: binding.to_string()});
                     break;
                 }
             }

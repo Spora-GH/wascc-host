@@ -16,11 +16,31 @@ jobs:
     - name: Run fmt
       run: cargo fmt -- --check
     - name: Build
-      run: cargo build --verbose --all-features    
+      run: cargo build --verbose --all-features
+
+  test_no_nats:
+    name: Test without lattice and NATS
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        engine: ["wasm3", "wasmtime"]
+
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run tests (no lattice no NATS)
+        run: cargo test --features "bin ${{ matrix.engine }}" -- --test-threads=1
   
   test:
     name: Test feature matrix
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        engine: ["wasm3", "wasmtime"]
 
     services:
       nats:
@@ -36,15 +56,15 @@ jobs:
           - 6379:6379
 
     steps:
-      - uses: actions/checkout@v2       
-      - name: Run tests Gantry+Manifest
-        run: cargo test --verbose --features "manifest gantry bin"      
+      - uses: actions/checkout@v2
+      - name: Run tests (featureless)
+        run: cargo test --features "bin ${{ matrix.engine }}" -- --test-threads=1
+      - name: Run tests (Everything but Lattice)
+        run: cargo test --features "manifest bin ${{ matrix.engine }}" -- --test-threads=1
       - name: Run tests (manifest only)
-        run: cargo test --verbose --features "manifest"      
-      - name: Run tests (gantry only)
-        run: cargo test --verbose --features "gantry"      
+        run: cargo test --features "manifest ${{ matrix.engine }}" -- --test-threads=1
       - name: Run tests (lattice mode)
-        run: cargo test --verbose --features "manifest lattice"
+        run: cargo test --features "lattice bin manifest ${{ matrix.engine }}" --test integration -- --test-threads=1
         env:
           LATTICE_HOST: 0.0.0.0
           LATTICE_RPC_TIMEOUT_MILLIS: 100

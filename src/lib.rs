@@ -1,18 +1,4 @@
 #![doc(html_logo_url = "https://avatars0.githubusercontent.com/u/52050279?s=200&v=4")]
-// Copyright 2015-2020 Capital One Services, LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 //! # waSCC Host
 //!
 //! The WebAssembly Secure Capabilities Connector (waSCC) host runtime manages actors
@@ -26,25 +12,25 @@
 //! # Example
 //! ```
 //! use std::collections::HashMap;
-//! use wascc_host::{WasccHost, Actor, NativeCapability};
+//! use wascc_host::{Host, Actor, NativeCapability};
 //!
 //! fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //!    env_logger::init();
-//!    let host = WasccHost::new();
+//!    let host = Host::new();
 //!    host.add_actor(Actor::from_file("./examples/.assets/echo.wasm")?)?;
 //!    host.add_actor(Actor::from_file("./examples/.assets/echo2.wasm")?)?;
 //!    host.add_native_capability(NativeCapability::from_file(
 //!        "./examples/.assets/libwascc_httpsrv.so", None
 //!    )?)?;
 //!
-//!    host.bind_actor(
+//!    host.set_binding(
 //!        "MDFD7XZ5KBOPLPHQKHJEMPR54XIW6RAG5D7NNKN22NP7NSEWNTJZP7JN",
 //!        "wascc:http_server",
 //!        None,
 //!        generate_port_config(8085),
 //!    )?;
 //!
-//!    host.bind_actor(
+//!    host.set_binding(
 //!        "MB4OLDIC3TCZ4Q4TGGOVAZC43VXFE2JQVRAXQMQFXUCREOOFEKOKZTY2",
 //!        "wascc:http_server",
 //!        None,
@@ -99,6 +85,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REVISION: u32 = 2;
 
 pub type Result<T> = std::result::Result<T, errors::Error>;
+
 pub use actor::Actor;
 pub use capability::NativeCapability;
 pub use inthost::{Invocation, InvocationResponse, WasccEntity};
@@ -109,17 +96,29 @@ pub use manifest::{BindingEntry, HostManifest};
 #[cfg(feature = "prometheus_middleware")]
 pub use middleware::prometheus;
 
+#[cfg(feature = "lattice")]
+use latticeclient::BusEvent;
+
+#[cfg(feature = "lattice")]
+use bus::lattice::ControlCommand;
+
 pub use authz::Authorizer;
 pub use middleware::Middleware;
-pub use wapc::{prelude::WasiParams, WapcHost};
+pub use wapc::WasiParams;
 
 pub type SubjectClaimsPair = (String, Claims<wascap::jwt::Actor>);
 
-use bus::MessageBus;
+use crate::inthost::fetch_oci_bytes;
+use bus::{get_namespace_prefix, MessageBus};
 use crossbeam::Sender;
+#[cfg(feature = "lattice")]
+use crossbeam_channel as channel;
+use crossbeam_channel::Receiver;
 #[cfg(any(feature = "lattice", feature = "manifest"))]
 use inthost::RESTRICTED_LABELS;
 use plugins::PluginManager;
+use std::path::Path;
+use std::str::FromStr;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -129,9 +128,9 @@ use wascap::prelude::KeyPair;
 use wascc_codec::{
     capabilities::CapabilityDescriptor,
     core::{CapabilityConfiguration, OP_BIND_ACTOR},
-    SYSTEM_ACTOR,
+    serialize, SYSTEM_ACTOR,
 };
-//type BindingsList = Vec<(String, String, String)>;
+
 type BindingsList = HashMap<BindingTuple, CapabilityConfiguration>;
 type BindingTuple = (String, String, String); // (from-actor, to-capid, to-binding-name)
 
@@ -152,9 +151,77 @@ impl RouteKey {
     }
 }
 
-/// Represents an instance of a waSCC host
+/// A builder pattern implementation for creating a custom-configured host runtime
+pub struct HostBuilder {
+    labels: HashMap<String, String>,
+    ns: Option<String>,
+    authorizer: Box<dyn Authorizer + 'static>,
+}
+
+impl HostBuilder {
+    /// Creates a new host builder. This builder will initialize itself with some defaults
+    /// obtained from the environment. The labels list will pre-populate with the `hostcore.*`
+    /// labels, the namespace will be gleaned from the `LATTICE_NAMESPACE` environment variable
+    /// (if lattice mode is enabled), and the default authorizer will be set.
+    pub fn new() -> HostBuilder {
+        let b = HostBuilder {
+            labels: inthost::detect_core_host_labels(),
+            ns: get_namespace_prefix(),
+            authorizer: Box::new(authz::DefaultAuthorizer::new()),
+        };
+
+        b
+    }
+
+    /// Sets the lattice namespace for this host. A lattice namespace is a unit of multi-tenant
+    /// isolation on a network. To reduce the risk of conflicts or subscription failures, the
+    /// lattice namespace should not include any non-alphanumeric characters.
+    #[cfg(feature = "lattice")]
+    pub fn with_lattice_namespace(self, ns: &str) -> HostBuilder {
+        if !ns.chars().all(char::is_alphanumeric) {
+            panic!("Cannot use a non-alphanumeric lattice namespace name");
+        }
+        HostBuilder {
+            ns: Some(ns.to_lowercase().to_string()),
+            ..self
+        }
+    }
+
+    /// Sets a custom authorizer to be used for authorizing actors, capability providers,
+    /// and invocation requests. Note that the authorizer cannot be used to implement _less_
+    /// strict measures than the default authorizer, it can only be used to implement
+    /// _more_ strict rules
+    pub fn with_authorizer(self, authorizer: impl Authorizer + 'static) -> HostBuilder {
+        HostBuilder {
+            authorizer: Box::new(authorizer),
+            ..self
+        }
+    }
+
+    /// Adds an arbitrary label->value pair of metadata to the host. Cannot override
+    /// reserved labels such as those that begin with `hostcore.` Calling this twice
+    /// on the same label will have no effect after the first call.
+    pub fn with_label(self, key: &str, value: &str) -> HostBuilder {
+        let mut hm = self.labels.clone();
+        if !hm.contains_key(key) {
+            hm.insert(key.to_string(), value.to_string());
+        }
+        HostBuilder { labels: hm, ..self }
+    }
+
+    /// Converts the transient builder instance into a realized host runtime instance
+    pub fn build(self) -> Host {
+        #[cfg(not(feature = "lattice"))]
+        let h = Host::generate(self.authorizer, self.labels, self.ns.clone());
+        #[cfg(feature = "lattice")]
+        let h = Host::generate(self.authorizer, self.labels, self.ns.clone());
+        h
+    }
+}
+
+/// Represents an instance of a waSCC host runtime
 #[derive(Clone)]
-pub struct WasccHost {
+pub struct Host {
     bus: Arc<MessageBus>,
     claims: Arc<RwLock<HashMap<String, Claims<wascap::jwt::Actor>>>>,
     plugins: Arc<RwLock<PluginManager>>,
@@ -163,85 +230,92 @@ pub struct WasccHost {
     middlewares: Arc<RwLock<Vec<Box<dyn Middleware>>>>,
     // the key to this field is the subscription subject, and not either a pk or a capid
     terminators: Arc<RwLock<HashMap<String, Sender<bool>>>>,
-    #[cfg(feature = "gantry")]
-    gantry_client: Arc<RwLock<Option<gantryclient::Client>>>,
-    key: KeyPair,
+    pk: String,
+    sk: String,
     authorizer: Arc<RwLock<Box<dyn Authorizer>>>,
     labels: Arc<RwLock<HashMap<String, String>>>,
+    // mapping between OCI registry image references and the associated unique identity (e.g. "Mxxx" and "Vxxx")
+    image_map: Arc<RwLock<HashMap<String, String>>>,
+    ns: Option<String>,
 }
 
-impl WasccHost {
-    /// Creates a new waSCC runtime host
+impl Host {
+    /// Creates a new runtime host using all of the default values. Use the host builder
+    /// if you want to provide more customization options
     pub fn new() -> Self {
-        Self::with_authorizer(authz::DefaultAuthorizer::new())
+        let h = Self::generate(
+            Box::new(authz::DefaultAuthorizer::new()),
+            inthost::detect_core_host_labels(),
+            get_namespace_prefix(),
+        );
+        h
     }
 
-    /// Creates a waSCC host with the given authorizer to be used for supplemental authorization checks
-    /// *after* the base claims check is performed. The authorizer can add further restrictions
-    /// to actors consuming capabilities, and can determine whether one actor is allowed to
-    /// invoke another (including itself, which can occur during manual configuration by a host).
-    pub fn with_authorizer(authz: impl Authorizer + 'static) -> Self {
+    pub(crate) fn generate(
+        authz: Box<dyn Authorizer + 'static>,
+        labels: HashMap<String, String>,
+        ns: Option<String>,
+    ) -> Self {
         let key = KeyPair::new_server();
         let claims = Arc::new(RwLock::new(HashMap::new()));
         let caps = Arc::new(RwLock::new(HashMap::new()));
         let bindings = Arc::new(RwLock::new(HashMap::new()));
-        let labels = Arc::new(RwLock::new(inthost::detect_core_host_labels()));
+        let labels = Arc::new(RwLock::new(labels));
+        let terminators = Arc::new(RwLock::new(HashMap::new()));
+        let authz = Arc::new(RwLock::new(authz));
+        let image_map = Arc::new(RwLock::new(HashMap::new()));
+
         #[cfg(feature = "lattice")]
-        let bus = bus::new(
+        let (com_s, com_r): (Sender<ControlCommand>, Receiver<ControlCommand>) =
+            channel::unbounded();
+
+        #[cfg(feature = "lattice")]
+        let bus = Arc::new(bus::new(
             key.public_key(),
             claims.clone(),
             caps.clone(),
             bindings.clone(),
             labels.clone(),
-        );
-        #[cfg(not(feature = "lattice"))]
-        let bus = bus::new();
+            terminators.clone(),
+            ns.clone(),
+            com_s,
+            authz.clone(),
+            image_map.clone(),
+        ));
 
-        #[cfg(feature = "gantry")]
-        let host = WasccHost {
-            terminators: Arc::new(RwLock::new(HashMap::new())),
-            bus: Arc::new(bus),
-            claims,
+        #[cfg(not(feature = "lattice"))]
+        let bus = Arc::new(bus::new());
+
+        #[cfg(feature = "lattice")]
+        let _ = bus.publish_event(BusEvent::HostStarted(key.public_key()));
+
+        let host = Host {
+            terminators: terminators.clone(),
+            bus: bus.clone(),
+            claims: claims.clone(),
             plugins: Arc::new(RwLock::new(PluginManager::default())),
             bindings,
             caps,
             middlewares: Arc::new(RwLock::new(vec![])),
-            gantry_client: Arc::new(RwLock::new(None)),
-            key: key,
-            authorizer: Arc::new(RwLock::new(Box::new(authz))),
+            pk: key.public_key(),
+            sk: key.seed().unwrap(),
+            authorizer: authz,
             labels,
+            ns,
+            image_map,
         };
-        #[cfg(not(feature = "gantry"))]
-        let host = WasccHost {
-            terminators: Arc::new(RwLock::new(HashMap::new())),
-            bus: Arc::new(bus),
-            claims,
-            plugins: Arc::new(RwLock::new(PluginManager::default())),
-            bindings,
-            middlewares: Arc::new(RwLock::new(vec![])),
-            caps,
-            key: key,
-            authorizer: Arc::new(RwLock::new(Box::new(authz))),
-            labels,
-        };
-        info!("Host ID is {} (v{})", host.key.public_key(), VERSION,);
+
+        info!("Host ID is {} (v{})", key.public_key(), VERSION);
+
         host.ensure_extras().unwrap();
+
+        #[cfg(feature = "lattice")]
+        let _ = bus::lattice::spawn_controlplane(&host, com_r);
+
         host
     }
 
-    /// Sets an arbitrary label on the host. Discoverable via lattice query
-    #[cfg(feature = "lattice")]
-    pub fn set_label(&self, label: &str, value: &str) {
-        if !RESTRICTED_LABELS.contains(&label) {
-            self.labels
-                .write()
-                .unwrap()
-                .insert(label.to_string(), value.to_string());
-        }
-    }
-
-    /// Adds an actor to the host
-    pub fn add_actor(&self, actor: Actor) -> Result<()> {
+    fn add_actor_imgref(&self, actor: Actor, imgref: Option<String>) -> Result<()> {
         if self
             .claims
             .read()
@@ -260,12 +334,14 @@ impl WasccHost {
             )));
         }
 
-        authz::register_claims(
-            self.claims.clone(),
-            &actor.token.claims.subject,
+        let c = self.claims.clone();
+
+        c.write().unwrap().insert(
+            actor.token.claims.subject.to_string(),
             actor.token.claims.clone(),
         );
 
+        let key = KeyPair::from_seed(&self.sk).unwrap();
         let wg = crossbeam_utils::sync::WaitGroup::new();
         // Spin up a new thread that listens to "wasmbus.Mxxxx" calls on the message bus
         spawns::spawn_actor(
@@ -279,16 +355,18 @@ impl WasccHost {
             self.middlewares.clone(),
             self.caps.clone(),
             self.bindings.clone(),
-            self.claims.clone(),
+            c.clone(),
             self.terminators.clone(),
-            self.key.clone(),
+            key,
             self.authorizer.clone(),
+            self.image_map.clone(),
+            imgref,
         )?;
         wg.wait();
         if actor.capabilities().contains(&extras::CAPABILITY_ID.into()) {
             // force a binding so that there's a private actor subject on the bus for the
             // actor to communicate with the extras provider
-            self.bind_actor(
+            self.set_binding(
                 &actor.public_key(),
                 extras::CAPABILITY_ID,
                 None,
@@ -299,44 +377,28 @@ impl WasccHost {
         Ok(())
     }
 
-    /// Adds an actor to the host by looking it up in a Gantry repository, downloading
-    /// the signed module bytes, and adding them to the host
-    #[cfg(feature = "gantry")]
-    pub fn add_actor_from_gantry(&self, actor: &str) -> Result<()> {
-        {
-            let lock = self.gantry_client.read().unwrap();
-            if lock.as_ref().is_none() {
-                return Err(errors::new(errors::ErrorKind::MiscHost(
-                    "No gantry client configured".to_string(),
-                )));
-            }
-        }
-        use crossbeam_channel::unbounded;
-        let (s, r) = unbounded();
-        let bytevec = Arc::new(RwLock::new(Vec::new()));
-        let b = bytevec.clone();
-        let _ack = self
-            .gantry_client
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .download_actor(actor, move |chunk| {
-                bytevec
-                    .write()
-                    .unwrap()
-                    .extend_from_slice(&chunk.chunk_bytes);
-                if chunk.sequence_no == chunk.total_chunks {
-                    s.send(true).unwrap();
-                }
-                Ok(())
-            });
-        let _ = r.recv().unwrap();
-        let vec = b.read().unwrap();
-        self.add_actor(Actor::from_bytes(vec.clone())?)
+    /// Adds an actor to the host. This will provision resources (such as a handler thread) for the actor. Actors
+    /// will not be able to make use of capability providers unless bindings are added (or existed prior to the actor
+    /// being added to a host, which is possible in `lattice` mode)
+    pub fn add_actor(&self, actor: Actor) -> Result<()> {
+        self.add_actor_imgref(actor, None)
     }
 
-    /// Adds a portable capability provider (e.g. a WASI actor) to the waSCC host
+    /// Adds an actor to the host by attempting to retrieve it from an OCI
+    /// registry. This function takes an image reference as an argument, e.g.
+    /// myregistry.mycloud.io/actor:v1
+    /// If OCI credentials are supplied in environment variables, those will be used.
+    pub fn add_actor_from_registry(&self, image: &str) -> Result<()> {
+        let bytes = inthost::fetch_oci_bytes(image)?;
+
+        self.add_actor_imgref(Actor::from_slice(&bytes)?, Some(image.to_string()))?;
+        Ok(())
+    }
+
+    /// Adds a portable capability provider (e.g. a WASI actor) to the waSCC host. Portable capability providers adhere
+    /// to the same contract as native capability providers, but they are implemented as "high-privilege WASM" modules
+    /// via WASI. Today, there is very little a WASI-based capability provider can do, but in the near future when
+    /// WASI gets a standardized networking stack, more providers can be written as portable modules.
     pub fn add_capability(
         &self,
         actor: Actor,
@@ -346,6 +408,7 @@ impl WasccHost {
         let binding = binding.unwrap_or("default");
 
         let wg = crossbeam_utils::sync::WaitGroup::new();
+        let key = KeyPair::from_seed(&self.sk).unwrap();
         // Spins up a new thread subscribed to the "wasmbus.{capid}.{binding}" subject
         spawns::spawn_actor(
             wg.clone(),
@@ -360,8 +423,10 @@ impl WasccHost {
             self.bindings.clone(),
             self.claims.clone(),
             self.terminators.clone(),
-            self.key.clone(),
+            key,
             self.authorizer.clone(),
+            self.image_map.clone(),
+            None,
         )?;
         wg.wait();
         Ok(())
@@ -369,8 +434,11 @@ impl WasccHost {
 
     /// Removes an actor from the host. Notifies the actor's processing thread to terminate,
     /// which will in turn attempt to unbind that actor from all previously bound capability providers
+    /// (in lattice mode, this unbinding only takes place if the actor is the last instance of its
+    /// kind in the lattice)
     pub fn remove_actor(&self, pk: &str) -> Result<()> {
-        self.terminators.read().unwrap()[&bus::actor_subject(pk)]
+        self.terminators.read().unwrap()
+            [&bus::actor_subject(self.ns.as_ref().map(String::as_str), pk)]
             .send(true)
             .unwrap();
         Ok(())
@@ -379,9 +447,11 @@ impl WasccHost {
     /// Replaces one running actor with another live actor with no message loss. Note that
     /// the time it takes to perform this replacement can cause pending messages from capability
     /// providers (e.g. messages from subscriptions or HTTP requests) to build up in a backlog,
-    /// so make sure the new actor can handle this stream of these delayed messages
+    /// so make sure the new actor can handle this stream of these delayed messages. Also ensure that
+    /// the underlying WebAssembly driver (chosen via feature flag) supports hot-swapping module bytes.
     pub fn replace_actor(&self, new_actor: Actor) -> Result<()> {
-        crate::inthost::replace_actor(&self.key, self.bus.clone(), new_actor)
+        let key = KeyPair::from_seed(&self.sk).unwrap();
+        crate::inthost::replace_actor(&key, self.bus.clone(), new_actor)
     }
 
     /// Adds a middleware item to the middleware processing pipeline
@@ -389,7 +459,10 @@ impl WasccHost {
         self.middlewares.write().unwrap().push(Box::new(mid));
     }
 
-    /// Adds a native capability provider plugin to the waSCC runtime. Note that because these capabilities are native,
+    /// Adds a native capability provider plugin to the host runtime. If running in lattice mode,
+    /// and at least one other instance of this same capability provider is running with previous
+    /// bindings, then the provider being added to this host will automatically reconstitute
+    /// the binding configuration. Note that because these capabilities are native,
     /// cross-platform support is not always guaranteed.
     pub fn add_native_capability(&self, capability: NativeCapability) -> Result<()> {
         let capid = capability.id();
@@ -400,7 +473,7 @@ impl WasccHost {
             .contains_key(&RouteKey::new(&capability.binding_name, &capability.id()))
         {
             return Err(errors::new(errors::ErrorKind::CapabilityProvider(format!(
-                "Capability provider {} cannot be bound to the same name ({}) twice, loading failed.", capid, capability.binding_name                
+                "Capability provider {} cannot be bound to the same name ({}) twice, loading failed.", capid, capability.binding_name
             ))));
         }
         self.caps.write().unwrap().insert(
@@ -408,6 +481,7 @@ impl WasccHost {
             capability.descriptor().clone(),
         );
         let wg = crossbeam_utils::sync::WaitGroup::new();
+        let key = KeyPair::from_seed(&self.sk).unwrap();
         spawns::spawn_native_capability(
             capability,
             self.bus.clone(),
@@ -416,10 +490,33 @@ impl WasccHost {
             self.terminators.clone(),
             self.plugins.clone(),
             wg.clone(),
-            Arc::new(self.key.clone()),
+            Arc::new(key),
         )?;
         wg.wait();
         Ok(())
+    }
+
+    /// Adds a native capability provider plugin to the host runtime by pulling the library from a provider archive
+    /// stored in an OCI-compliant registry. This file will be stored in the operating system's designated temporary
+    /// directory after being downloaded.
+    pub fn add_native_capability_from_registry(
+        &self,
+        image_ref: &str,
+        binding_name: Option<String>,
+    ) -> Result<()> {
+        let b = binding_name.unwrap_or("default".to_string());
+        match crate::inthost::fetch_provider(image_ref, &b, self.labels.clone()) {
+            Ok((prov, claims)) => {
+                self.add_native_capability(prov)?;
+                // Only write to the image map if the above add function succeeds
+                self.image_map
+                    .write()
+                    .unwrap()
+                    .insert(image_ref.to_string(), claims.subject.to_string());
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Removes a native capability provider plugin from the waSCC runtime
@@ -429,7 +526,8 @@ impl WasccHost {
         binding_name: Option<String>,
     ) -> Result<()> {
         let b = binding_name.unwrap_or("default".to_string());
-        let subject = bus::provider_subject(capability_id, &b);
+        let subject =
+            bus::provider_subject(self.ns.as_ref().map(String::as_str), capability_id, &b);
         if let Some(terminator) = self.terminators.read().unwrap().get(&subject) {
             terminator.send(true).unwrap();
             Ok(())
@@ -440,17 +538,55 @@ impl WasccHost {
         }
     }
 
+    /// Removes a binding between an actor and the indicated capability provider. In lattice mode,
+    /// this operation has a _lattice global_ scope, and so all running instances of the indicated
+    /// capability provider will be asked to dispose of any resources provisioned for the given
+    /// actor.
+    pub fn remove_binding(
+        &self,
+        actor: &str,
+        capid: &str,
+        binding_name: Option<String>,
+    ) -> Result<()> {
+        let cfg = CapabilityConfiguration {
+            module: actor.to_string(),
+            values: HashMap::new(),
+        };
+        let buf = serialize(&cfg).unwrap();
+        let binding = binding_name.unwrap_or("default".to_string());
+        let key = KeyPair::from_seed(&self.sk).unwrap();
+        let inv_r = self.bus.invoke(
+            &self.bus.provider_subject(&capid, &binding), // The OP_REMOVE_ACTOR invocation should go to _all_ instances of the provider being unbound
+            crate::inthost::gen_remove_actor(&key, buf.clone(), &binding, &capid),
+        )?;
+        if let Some(s) = inv_r.error {
+            Err(format!("Failed to remove binding: {}", s).into())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Binds an actor to a capability provider with a given configuration. If the binding name
-    /// is `None` then the default binding name will be used. An actor can only have one default
-    /// binding per capability provider.
-    pub fn bind_actor(
+    /// is `None` then the default binding name will be used (`default`). An actor can only have one named
+    /// binding per capability provider. In lattice mode, the call to this function has a _lattice global_
+    /// scope, and so all running instances of the indicated provider will be notified and provision
+    /// resources accordingly. For example, if you create a binding between an actor and an HTTP server
+    /// provider, and there are four instances of that provider running in the lattice, each of those
+    /// four hosts will start an HTTP server on the indicated port.
+    pub fn set_binding(
         &self,
         actor: &str,
         capid: &str,
         binding_name: Option<String>,
         config: HashMap<String, String>,
     ) -> Result<()> {
+        #[cfg(feature = "lattice")]
+        let claims = self.bus.discover_claims(actor);
+        #[cfg(not(feature = "lattice"))]
         let claims = self.claims.read().unwrap().get(actor).cloned();
+
+        let key = KeyPair::from_seed(&self.sk).unwrap();
+
         if claims.is_none() {
             return Err(errors::new(errors::ErrorKind::MiscHost(
                 "Attempted to bind non-existent actor".to_string(),
@@ -486,13 +622,13 @@ impl WasccHost {
 
         let tgt_subject = if (actor == capid || actor == SYSTEM_ACTOR) && capid.starts_with("M") {
             // manually injected actor configuration
-            bus::actor_subject(actor)
+            bus::actor_subject(self.ns.as_ref().map(String::as_str), actor)
         } else {
-            bus::provider_subject(capid, &binding)
+            bus::provider_subject(self.ns.as_ref().map(String::as_str), capid, &binding)
         };
-        info!("Binding subject: {}", tgt_subject);
+        trace!("Binding subject: {}", tgt_subject);
         let inv = inthost::gen_config_invocation(
-            &self.key,
+            &key,
             actor,
             capid,
             c.clone(),
@@ -516,6 +652,13 @@ impl WasccHost {
                             values: config,
                         },
                     )?;
+                    #[cfg(feature = "lattice")]
+                    let _ = self.bus.publish_event(BusEvent::ActorBindingCreated {
+                        actor: actor.to_string(),
+                        capid: capid.to_string(),
+                        instance_name: binding.to_string(),
+                        host: self.id(),
+                    });
                     Ok(())
                 }
             }
@@ -526,40 +669,41 @@ impl WasccHost {
         }
     }
 
-    /// Configure the Gantry client connection information to be used when actors
-    /// are loaded remotely via `Actor::from_gantry`
-    #[cfg(feature = "gantry")]
-    pub fn configure_gantry(&self, nats_urls: Vec<String>, jwt: &str, seed: &str) -> Result<()> {
-        *self.gantry_client.write().unwrap() =
-            Some(gantryclient::Client::new(nats_urls, jwt, seed));
-        Ok(())
-    }
-
     /// Invoke an operation handler on an actor directly. The caller is responsible for
-    /// knowing ahead of time if the given actor supports the specified operation.
+    /// knowing ahead of time if the given actor supports the specified operation. In lattice
+    /// mode, this call will still only attempt a _local_ invocation on the host and will not
+    /// make a lattice-wide call. If you want to make lattice-wide invocations, please use
+    /// the lattice client library.
     pub fn call_actor(&self, actor: &str, operation: &str, msg: &[u8]) -> Result<Vec<u8>> {
+        let key = KeyPair::from_seed(&self.sk).unwrap();
         if !self.claims.read().unwrap().contains_key(actor) {
             return Err(errors::new(errors::ErrorKind::MiscHost(
                 "No such actor".into(),
             )));
         }
         let inv = Invocation::new(
-            &self.key,
+            &key,
             WasccEntity::Actor(SYSTEM_ACTOR.to_string()),
             WasccEntity::Actor(actor.to_string()),
             operation,
             msg.to_vec(),
         );
-        let tgt_subject = bus::actor_subject(actor);
+        let tgt_subject = bus::actor_subject(self.ns.as_ref().map(String::as_str), actor);
         match self.bus.invoke(&tgt_subject, inv) {
-            Ok(resp) => Ok(resp.msg),
+            Ok(resp) => match resp.error {
+                Some(e) => Err(format!("Invocation failure: {}", e).into()),
+                None => Ok(resp.msg),
+            },
             Err(e) => Err(e),
         }
     }
 
-    /// Returns the full set of JWT claims for a given actor, if that actor is running in the host
+    /// Returns the full set of JWT claims for a given actor, if that actor is running in the host. This
+    /// call will not query other hosts in the lattice if lattice mode is enabled.
     pub fn claims_for_actor(&self, pk: &str) -> Option<Claims<wascap::jwt::Actor>> {
-        self.claims.read().unwrap().get(pk).cloned()
+        let c = self.claims.read().unwrap().get(pk).cloned();
+
+        c
     }
 
     /// Applies a manifest JSON or YAML file to set up a host's actors, capability providers,
@@ -575,18 +719,21 @@ impl WasccHost {
             }
         }
         for actor in manifest.actors {
-            #[cfg(feature = "gantry")]
-            self.add_actor_gantry_first(&actor)?;
-
-            #[cfg(not(feature = "gantry"))]
-            self.add_actor(Actor::from_file(&actor)?)?;
+            self.add_actor_file_first(&actor)?; // If file, add .wasm, otherwise assume it's an OCI ref
         }
         for cap in manifest.capabilities {
             // for now, supports only file paths
-            self.add_native_capability(NativeCapability::from_file(cap.path, cap.binding_name)?)?;
+            if Path::new(&cap.path).exists() {
+                self.add_native_capability(NativeCapability::from_file(
+                    cap.path,
+                    cap.binding_name,
+                )?)?;
+            } else {
+                self.add_native_capability_from_registry(&cap.path, cap.binding_name)?;
+            }
         }
         for config in manifest.bindings {
-            self.bind_actor(
+            self.set_binding(
                 &config.actor,
                 &config.capability,
                 config.binding,
@@ -596,17 +743,16 @@ impl WasccHost {
         Ok(())
     }
 
-    #[cfg(feature = "gantry")]
-    fn add_actor_gantry_first(&self, actor: &str) -> Result<()> {
-        if actor.len() == 56 && actor.starts_with('M') {
-            // This is an actor's public subject
-            self.add_actor_from_gantry(actor)
-        } else {
+    fn add_actor_file_first(&self, actor: &str) -> Result<()> {
+        if std::path::Path::new(actor).exists() {
             self.add_actor(Actor::from_file(&actor)?)
+        } else {
+            self.add_actor_from_registry(actor)
         }
     }
 
-    /// Returns the list of actors registered in the host
+    /// Returns the list of actors registered in the host. Even if lattice mode is enabled, this function
+    /// will only return the list of actors in this specific host
     pub fn actors(&self) -> Vec<SubjectClaimsPair> {
         authz::get_all_claims(self.claims.clone())
     }
@@ -625,7 +771,7 @@ impl WasccHost {
     }
 
     /// Returns the list of actors in the host that contain all of the tags in the
-    /// supplied parameter
+    /// supplied parameter. This function will not make a lattice-wide tag query
     pub fn actors_by_tag(&self, tags: &[&str]) -> Vec<String> {
         let mut actors = vec![];
 
@@ -644,14 +790,23 @@ impl WasccHost {
     /// the host and then removing all capability providers. This function is not guaranteed to
     /// block and wait for the shutdown to finish
     pub fn shutdown(&self) -> Result<()> {
-        let actors = self.actors();
-        for (pk, _claims) in actors {
-            self.remove_actor(&pk)?;
+        {
+            let lock = self.claims.read().unwrap();
+            let actors: Vec<_> = lock.values().collect();
+            for claims in actors {
+                self.remove_actor(&claims.subject)?;
+            }
         }
         let caps = self.capabilities();
         for (binding_name, capid) in caps.keys() {
             self.remove_native_capability(&capid, Some(binding_name.to_string()))?;
         }
+        self.bus.disconnect();
         Ok(())
+    }
+
+    /// Returns the public key of the host
+    pub fn id(&self) -> String {
+        self.pk.to_string()
     }
 }

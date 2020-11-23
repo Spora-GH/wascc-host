@@ -1,17 +1,3 @@
-// Copyright 2015-2020 Capital One Services, LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use crate::authz;
 use crate::Result;
 use std::fs::File;
@@ -30,9 +16,12 @@ pub struct Actor {
 impl Actor {
     /// Create an actor from the bytes of a signed WebAssembly module. Attempting to load
     /// an unsigned module, or a module signed improperly, will result in an error
-    pub fn from_bytes(buf: Vec<u8>) -> Result<Actor> {
+    pub fn from_slice(buf: &[u8]) -> Result<Actor> {
         let token = authz::extract_claims(&buf)?;
-        Ok(Actor { token, bytes: buf })
+        Ok(Actor {
+            token,
+            bytes: buf.to_vec(),
+        })
     }
 
     /// Create an actor from a signed WebAssembly (`.wasm`) file
@@ -41,7 +30,7 @@ impl Actor {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
 
-        Actor::from_bytes(buf)
+        Actor::from_slice(&buf)
     }
 
     /// Obtain the actor's public key (The `sub` field of a JWT). This can be treated as a globally unique identifier

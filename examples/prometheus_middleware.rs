@@ -1,17 +1,3 @@
-// Copyright 2015-2020 Capital One Services, LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #[cfg(feature = "prometheus_middleware")]
 fn main() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     prometheus_example::run_example()
@@ -28,11 +14,11 @@ mod prometheus_example {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use wascc_host::middleware::prometheus::{PrometheusConfig, PrometheusMiddleware};
-    use wascc_host::{Actor, NativeCapability, WasccHost};
+    use wascc_host::{Actor, Host, NativeCapability};
 
     pub fn run_example() -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         env_logger::init();
-        let host = WasccHost::new();
+        let host = Host::new();
         host.add_actor(Actor::from_file("./examples/.assets/echo.wasm")?)?;
         host.add_actor(Actor::from_file("./examples/.assets/echo2.wasm")?)?;
         host.add_native_capability(NativeCapability::from_file(
@@ -48,13 +34,13 @@ mod prometheus_example {
         };
         host.add_middleware(PrometheusMiddleware::new(config).unwrap());
 
-        host.bind_actor(
+        host.set_binding(
             "MB4OLDIC3TCZ4Q4TGGOVAZC43VXFE2JQVRAXQMQFXUCREOOFEKOKZTY2",
             "wascc:http_server",
             None,
             generate_port_config(8081),
         )?;
-        host.bind_actor(
+        host.set_binding(
             "MDFD7XZ5KBOPLPHQKHJEMPR54XIW6RAG5D7NNKN22NP7NSEWNTJZP7JN",
             "wascc:http_server",
             None,
