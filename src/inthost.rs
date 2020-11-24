@@ -25,8 +25,8 @@ use wascc_codec::{
     core::{CapabilityConfiguration, OP_PERFORM_LIVE_UPDATE, OP_REMOVE_ACTOR},
     deserialize, serialize, SYSTEM_ACTOR,
 };
-use opentelemetry;
-use opentelemetry::Context;
+pub use opentelemetry;
+pub use opentelemetry::Context;
 
 pub(crate) const CORELABEL_ARCH: &str = "hostcore.arch";
 pub(crate) const CORELABEL_OS: &str = "hostcore.os";
