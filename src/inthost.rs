@@ -230,7 +230,7 @@ pub struct Invocation {
     pub id: String,
     pub encoded_claims: String,
     pub host_id: String,
-    pub context: Option<Context>
+    pub context: Option<opentelemetry::Context>
 }
 
 /// Represents an invocation target - either an actor or a bound capability provider
